@@ -2,8 +2,6 @@ const express = require('express');
 
 const os = require('os');
 
-const fs = require('fs');
-
 const app = express();
 
 const cheerio = require('cheerio');
@@ -14,9 +12,17 @@ const sharp = require('sharp');
 
 const { default: axios } = require('axios');
 
-const dataDir = '/home/favicon';
-const port = 8080;
+const _f = require('./f');
 
+const dataDir = {
+  favicon: '/home/data/favicon',
+  bigBg: '/home/data/bigBg',
+  smallBg: '/home/data/smallBg',
+};
+const port = 8080;
+_f.c.mkdirSync(dataDir.bigBg, { recursive: true });
+_f.c.mkdirSync(dataDir.smallBg, { recursive: true });
+_f.c.mkdirSync(dataDir.favicon, { recursive: true });
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header(
@@ -53,35 +59,56 @@ function getLocahost() {
   });
   return arr;
 }
-function base64ToBuffer(data) {
-  const base64 = data.replace(/^data:image\/\w+;base64,/, ''); //去掉图片base64码前面部分data:image/png;base64
-  return Buffer.from(base64, 'base64'); //把base64码转成buffer对象，
-}
+// 删除超7天的缓存
+setInterval(async () => {
+  try {
+    if (!_f.c.existsSync(dataDir.favicon)) return;
+    const now = Date.now();
+    (await _f.p.readdir(dataDir.favicon)).forEach(async (item) => {
+      const f = `${dataDir.favicon}/${item}`;
+      const s = await _f.p.stat(f);
+      if (now - s.ctime.getTime() > 7 * 24 * 60 * 60 * 1000) {
+        _f.del(f);
+      }
+    });
+  } catch (error) {}
+}, 12 * 60 * 60 * 1000);
 async function downFile(url, path) {
-  const res = await axios({
-    method: 'get',
-    url,
-    responseType: 'arraybuffer',
-    timeout: 5000,
-  });
-  fs.writeFileSync(path, res.data);
-  return Promise.resolve();
+  try {
+    const res = await axios({
+      method: 'get',
+      url,
+      responseType: 'arraybuffer',
+      timeout: 5000,
+      maxContentLength: 1024 * 200,
+      maxBodyLength: 1024 * 200,
+    });
+    await _f.p.writeFile(path, res.data);
+  } catch (error) {
+    throw error;
+  }
 }
 app.get('/getfavicon', async (req, res) => {
+  let p = '';
   try {
     const u = new URL(req.query.u);
     const eu = encodeURIComponent(u.host);
-    const p = decodeURI(`${dataDir}/${eu}.png`);
-    if (fs.existsSync(p)) {
+    const p = decodeURI(`${dataDir.favicon}/${eu}.png`);
+    if (_f.c.existsSync(p)) {
       res.sendFile(p);
       return;
     }
-    fs.mkdirSync(dataDir, { recursive: true });
-    let result = await axios({
+    const prefix = `${u.protocol}//${u.host}`;
+    await _f.mkdir(dataDir.favicon);
+    const result = await axios({
       method: 'get',
-      url: `${u.protocol}//${u.host}`,
+      url: prefix,
       timeout: 5000,
     });
+    const contentType = result.headers['content-type'];
+    if (!contentType || !contentType.includes('text/html')) {
+      throw new Error(`只允许获取HTML文件`);
+    }
     const $ = cheerio.load(result.data);
     const arr = $('link');
     let icon = null;
@@ -93,50 +120,50 @@ app.get('/getfavicon', async (req, res) => {
         break;
       }
     }
-    if (!icon) {
-      await downFile(`${u.protocol}//${u.host}/favicon.ico`, p);
-    } else {
-      let iconUrl = icon.attribs.href;
-      if (/^data\:image/i.test(iconUrl)) {
-        const buf = base64ToBuffer(iconUrl);
-        fs.writeFileSync(p, buf);
-      } else {
-        if (iconUrl.startsWith('//')) {
+    let iconUrl = `${prefix}/favicon.ico`;
+    if (icon) {
+      const href = icon.attribs.href;
+      if (!/^data\:image/i.test(href)) {
+        if (/^http/i.test(href)) {
+          iconUrl = href;
+        } else if (/^\/\//.test(href)) {
           // '//aa.com/img/xxx.png
-          iconUrl = u.protocol + iconUrl;
-        } else if (!iconUrl.startsWith('http')) {
-          let str = `${u.protocol}//${u.host}`;
-          if (iconUrl.startsWith('/')) {
-            // '/img/xxx.png'
-            iconUrl = str + iconUrl;
-          } else if (iconUrl.startsWith('.')) {
-            // './img/xxx.png'
-            iconUrl = str + iconUrl.slice(1);
-          } else {
-            // 'img/xxx.png'
-            iconUrl = str + '/' + iconUrl;
-          }
+          iconUrl = u.protocol + href;
+        } else if (/^\//.test(href)) {
+          // '/img/xxx.png'
+          iconUrl = prefix + href;
+        } else if (/^\./.test(href)) {
+          // './img/xxx.png'
+          iconUrl = prefix + href.slice(1);
+        } else {
+          // 'img/xxx.png'
+          iconUrl = prefix + '/' + href;
         }
-        await downFile(iconUrl, p);
       }
     }
-    if (fs.existsSync(p)) {
+    await downFile(iconUrl, p);
+    if (_f.c.existsSync(p)) {
       try {
         const buf = await compressionImg(p);
-        fs.writeFileSync(p, buf);
+        await _f.p.writeFile(p, buf);
       } catch (error) {}
       res.sendFile(p);
     } else {
       throw new Error();
     }
-    res.sendFile(p);
   } catch (error) {
-    res.sendFile(resolve(__dirname, 'mrlogo.png'));
+    const dPath = resolve(__dirname, 'mrlogo.png');
+    if (p) {
+      try {
+        await _f.cp(dPath, p);
+      } catch (error) {}
+    }
+    res.sendFile(dPath);
   }
 });
 async function compressionImg(path, x = 400, y = 400, quality) {
   try {
-    const inputBuf = fs.readFileSync(path);
+    const inputBuf = await _f.p.readFile(path);
     const img = sharp(inputBuf);
     const meta = await img.metadata();
     const buf = await img
@@ -147,8 +174,48 @@ async function compressionImg(path, x = 400, y = 400, quality) {
           : { quality }
       )
       .toBuffer();
-    return Promise.resolve(buf);
+    return buf;
   } catch (error) {
-    return Promise.reject(error);
+    throw error;
   }
 }
+async function getAllFile(path) {
+  try {
+    const arr = [];
+    async function getFile(path) {
+      try {
+        const s = await _f.p.stat(path);
+        if (s.isDirectory()) {
+          const list = await _f.p.readdir(path);
+          for (let i = 0; i < list.length; i++) {
+            await getFile(`${path}/${list[i]}`);
+          }
+        } else {
+          arr.push(path);
+        }
+      } catch (error) {}
+    }
+    await getFile(path);
+    return arr;
+  } catch (error) {
+    return [];
+  }
+}
+function randomNum(x, y) {
+  return Math.round(Math.random() * (y - x) + x);
+}
+app.get('/bg', async (req, res) => {
+  const { s } = req.query;
+  let list = [];
+  if (s) {
+    list = await getAllFile(dataDir.smallBg);
+  } else {
+    list = await getAllFile(dataDir.bigBg);
+  }
+  if (list.length > 0) {
+    const idx = randomNum(0, list.length - 1);
+    res.sendFile(list[idx]);
+  } else {
+    res.send('壁纸库为空');
+  }
+});
